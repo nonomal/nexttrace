@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/xgadget-lab/nexttrace/trace"
+	"github.com/nxtrace/NTrace-core/trace"
 
-	"github.com/xgadget-lab/nexttrace/ipgeo"
+	"github.com/nxtrace/NTrace-core/ipgeo"
 )
 
 // var dataOrigin string
@@ -19,6 +19,8 @@ import (
 // 		}
 // 	}
 // }
+
+//此文件目前仅供classic_printer使用
 
 const (
 	RED_PREFIX    = "\033[1;31m"
@@ -33,6 +35,7 @@ func HopPrinter(h trace.Hop, info HopInfo) {
 	if h.Address == nil {
 		fmt.Println("\t*")
 	} else {
+		applyLangSetting(&h) // 应用语言设置
 		txt := "\t"
 
 		if h.Hostname == "" {
@@ -43,6 +46,9 @@ func HopPrinter(h trace.Hop, info HopInfo) {
 
 		if h.Geo != nil {
 			txt += " " + formatIpGeoData(h.Address.String(), h.Geo)
+		}
+		for _, v := range h.MPLS {
+			txt += " " + v
 		}
 		switch info {
 		case IXP:
@@ -74,12 +80,13 @@ func formatIpGeoData(ip string, data *ipgeo.IPGeoData) string {
 
 	// TODO: 判断阿里云和腾讯云内网，数据不足，有待进一步完善
 	// TODO: 移动IDC判断到Hop.fetchIPData函数，减少API调用
-	if strings.HasPrefix(ip, "9.") {
-		res = append(res, "LAN Address")
-	} else if strings.HasPrefix(ip, "11.") {
-		res = append(res, "LAN Address")
-	} else if data.Country == "" {
-		res = append(res, "LAN Address")
+	//if strings.HasPrefix(ip, "9.") {
+	//	res = append(res, "LAN Address")
+	//} else if strings.HasPrefix(ip, "11.") {
+	//	res = append(res, "LAN Address")
+	//} else if data.Country == "" {
+	//	res = append(res, "LAN Address")
+	if false {
 	} else {
 		// 有些IP的归属信息为空，这个时候将ISP的信息填入
 		if data.Owner == "" {

@@ -2,103 +2,196 @@ package printer
 
 import (
 	"fmt"
+	"github.com/nxtrace/NTrace-core/util"
+	"net"
+	"strconv"
 	"strings"
 
-	"github.com/xgadget-lab/nexttrace/trace"
+	"github.com/fatih/color"
+	"github.com/nxtrace/NTrace-core/trace"
 )
-
-type HopInfo int
-
-const (
-	General HopInfo = 0
-	IXP     HopInfo = 1
-	Peer    HopInfo = 2
-	PoP     HopInfo = 3
-	Aboard  HopInfo = 4
-)
-
-func findLatestAvailableHop(res *trace.Result, ttl int, probesIndex int) int {
-	for ttl > 0 {
-		// 查找上一个跃点是不是有效结果
-		ttl--
-		// 判断此TTL跃点是否有效并判断地理位置结构体是否已经初始化
-		if len(res.Hops[ttl]) != 0 && res.Hops[ttl][probesIndex].Success && res.Hops[ttl][probesIndex].Geo != nil {
-			// TTL虽有效，但地理位置API没有能够正确返回数据，依旧不能视为有效数据
-			if res.Hops[ttl][probesIndex].Geo.Country == "" {
-				// 跳过继续寻找上一个有效跃点
-				continue
-			}
-			return ttl
-		}
-	}
-	// 没找到
-	return -1
-}
-
-func unifyName(name string) string {
-	if name == "China" || name == "CN" {
-		return "中国"
-	} else if name == "Hong kong" || name == "香港" || name == "Central and Western" {
-		return "中国香港"
-	} else if name == "Taiwan" || name == "台湾" {
-		return "中国台湾"
-	} else {
-		return name
-	}
-}
-
-func chinaISPPeer(hostname string) bool {
-	var keyWords = []string{"china", "ct", "cu", "cm", "cnc", "4134", "4837", "4809", "9929"}
-	for _, k := range keyWords {
-		if strings.Contains(strings.ToLower(hostname), k) {
-			return true
-		}
-	}
-	return false
-}
-
-func chinaMainland(h trace.Hop) bool {
-	if unifyName(h.Geo.Country) == "中国" && unifyName(h.Geo.Prov) != "中国香港" && unifyName(h.Geo.Prov) != "中国台湾" {
-		return true
-	} else {
-		return false
-	}
-}
-
-func makeHopsType(res *trace.Result, ttl int) map[int]HopInfo {
-	// 创建一个字典，存放所有当前TTL的跃点类型集合
-	hopProbesMap := make(map[int]HopInfo)
-	for i := range res.Hops[ttl] {
-		// 判断是否res.Hops[ttl][i]是一个有效的跃点并且地理位置信息已经初始化
-		if res.Hops[ttl][i].Success && res.Hops[ttl][i].Geo != nil {
-			if availableTTL := findLatestAvailableHop(res, ttl, i); availableTTL != -1 {
-				switch {
-				case strings.Contains(res.Hops[ttl][i].Geo.District, "IXP") || strings.Contains(strings.ToLower(res.Hops[ttl][i].Hostname), "ix"):
-					hopProbesMap[i] = IXP
-				case strings.Contains(res.Hops[ttl][i].Geo.District, "Peer") || chinaISPPeer(res.Hops[ttl][i].Hostname):
-					hopProbesMap[i] = Peer
-				case strings.Contains(res.Hops[ttl][i].Geo.District, "PoP"):
-					hopProbesMap[i] = PoP
-				// 2个有效跃点必须都为有效数据，如果当前跳没有地理位置信息或者为局域网，不能视为有效节点
-				case res.Hops[availableTTL][i].Geo.Country != "LAN Address" && res.Hops[ttl][i].Geo.Country != "LAN Address" && res.Hops[ttl][i].Geo.Country != "" &&
-					// 一个跃点在中国大陆，另外一个跃点在其他地区，则可以推断出数据包跨境
-					chinaMainland(res.Hops[availableTTL][i]) != chinaMainland(res.Hops[ttl][i]):
-					// TODO: 将先后2跳跃点信息汇报给API，以完善相关数据
-					hopProbesMap[i] = Aboard
-				}
-			} else {
-				hopProbesMap[i] = General
-			}
-		}
-	}
-
-	return hopProbesMap
-}
 
 func RealtimePrinter(res *trace.Result, ttl int) {
-	fmt.Print(ttl + 1)
-	hopsTypeMap := makeHopsType(res, ttl)
-	for i := range res.Hops[ttl] {
-		HopPrinter(res.Hops[ttl][i], hopsTypeMap[i])
+	fmt.Printf("%s  ", color.New(color.FgHiYellow, color.Bold).Sprintf("%-2d", ttl+1))
+	// 去重
+	var latestIP string
+	tmpMap := make(map[string][]string)
+	for i, v := range res.Hops[ttl] {
+		if v.Address == nil && latestIP != "" {
+			tmpMap[latestIP] = append(tmpMap[latestIP], fmt.Sprintf("%s ms", "*"))
+			continue
+		} else if v.Address == nil {
+			continue
+		}
+
+		if _, exist := tmpMap[v.Address.String()]; !exist {
+			tmpMap[v.Address.String()] = append(tmpMap[v.Address.String()], strconv.Itoa(i))
+			// 首次进入
+			if latestIP == "" {
+				for j := 0; j < i; j++ {
+					tmpMap[v.Address.String()] = append(tmpMap[v.Address.String()], fmt.Sprintf("%s ms", "*"))
+				}
+			}
+			latestIP = v.Address.String()
+		}
+
+		tmpMap[v.Address.String()] = append(tmpMap[v.Address.String()], fmt.Sprintf("%.2f ms", v.RTT.Seconds()*1000))
+	}
+
+	if latestIP == "" {
+		fmt.Fprintf(color.Output, "%s\n",
+			color.New(color.FgWhite, color.Bold).Sprintf("*"),
+		)
+		return
+	}
+
+	var blockDisplay = false
+	for ip, v := range tmpMap {
+		if blockDisplay {
+			fmt.Printf("%4s", "")
+		}
+		if net.ParseIP(ip).To4() == nil {
+			if util.EnableHidDstIP == "" || ip != util.DestIP {
+				fmt.Fprintf(color.Output, "%s",
+					color.New(color.FgWhite, color.Bold).Sprintf("%-25s", ip),
+				)
+			} else {
+				fmt.Fprintf(color.Output, "%s",
+					color.New(color.FgWhite, color.Bold).Sprintf("%-25s", util.HideIPPart(ip)),
+				)
+			}
+		} else {
+			if util.EnableHidDstIP == "" || ip != util.DestIP {
+				fmt.Fprintf(color.Output, "%s",
+					color.New(color.FgWhite, color.Bold).Sprintf("%-15s", ip),
+				)
+			} else {
+				fmt.Fprintf(color.Output, "%s",
+					color.New(color.FgWhite, color.Bold).Sprintf("%-15s", util.HideIPPart(ip)),
+				)
+			}
+		}
+
+		i, _ := strconv.Atoi(v[0])
+		if res.Hops[ttl][i].Geo.Asnumber != "" {
+			/*** CMIN2, CUG, CN2, CUII, CTG 改为壕金色高亮
+			/* 小孩子不懂事加着玩的
+			/* 此处的高亮不代表任何线路质量
+			/* 仅代表走了这部分的ASN
+			/* 如果使用这些ASN的IP同样会被高亮
+			***/
+			switch {
+			case res.Hops[ttl][i].Geo.Asnumber == "58807":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "10099":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "4809":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "9929":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "23764":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Whois == "CTG-CN":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Whois == "[CNC-BACKBONE]":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Whois == "[CUG-BACKBONE]":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Whois == "CMIN2-NET":
+				fallthrough
+			case strings.HasPrefix(res.Hops[ttl][i].Address.String(), "59.43."):
+				fmt.Fprintf(color.Output, " %s", color.New(color.FgHiYellow, color.Bold).Sprintf("AS%-6s", res.Hops[ttl][i].Geo.Asnumber))
+			default:
+				fmt.Fprintf(color.Output, " %s", color.New(color.FgHiGreen, color.Bold).Sprintf("AS%-6s", res.Hops[ttl][i].Geo.Asnumber))
+			}
+
+		} else {
+			fmt.Printf(" %-8s", "*")
+		}
+
+		if net.ParseIP(ip).To4() != nil {
+			whoisFormat := strings.Split(res.Hops[ttl][i].Geo.Whois, "-")
+			if len(whoisFormat) > 1 {
+				whoisFormat[0] = strings.Join(whoisFormat[:2], "-")
+			}
+
+			if whoisFormat[0] != "" {
+				//如果以RFC或DOD开头那么为空
+				if !(strings.HasPrefix(whoisFormat[0], "RFC") ||
+					strings.HasPrefix(whoisFormat[0], "DOD")) {
+					whoisFormat[0] = "[" + whoisFormat[0] + "]"
+				} else {
+					whoisFormat[0] = ""
+				}
+			}
+
+			// CMIN2, CUII, CN2, CUG 改为壕金色高亮
+			switch {
+			case res.Hops[ttl][i].Geo.Asnumber == "58807":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "10099":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "4809":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "9929":
+				fallthrough
+			case res.Hops[ttl][i].Geo.Asnumber == "23764":
+				fallthrough
+			case whoisFormat[0] == "[CTG-CN]":
+				fallthrough
+			case whoisFormat[0] == "[CNC-BACKBONE]":
+				fallthrough
+			case whoisFormat[0] == "[CUG-BACKBONE]":
+				fallthrough
+			case whoisFormat[0] == "[CMIN2-NET]":
+				fallthrough
+			case strings.HasPrefix(res.Hops[ttl][i].Address.String(), "59.43."):
+				fmt.Fprintf(color.Output, " %s", color.New(color.FgHiYellow, color.Bold).Sprintf("%-16s", whoisFormat[0]))
+			default:
+				fmt.Fprintf(color.Output, " %s", color.New(color.FgHiGreen, color.Bold).Sprintf("%-16s", whoisFormat[0]))
+			}
+		}
+
+		applyLangSetting(&res.Hops[ttl][i]) // 应用语言设置
+
+		if net.ParseIP(ip).To4() != nil {
+
+			fmt.Fprintf(color.Output, " %s %s %s %s %s\n    %s   ",
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.Country),
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.Prov),
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.City),
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.District),
+				fmt.Sprintf("%-6s", res.Hops[ttl][i].Geo.Owner),
+				color.New(color.FgHiBlack, color.Bold).Sprintf("%-39s", res.Hops[ttl][i].Hostname),
+			)
+		} else {
+			fmt.Fprintf(color.Output, " %s %s %s %s %s\n    %s   ",
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.Country),
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.Prov),
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.City),
+				color.New(color.FgWhite, color.Bold).Sprintf("%s", res.Hops[ttl][i].Geo.District),
+				fmt.Sprintf("%-6s", res.Hops[ttl][i].Geo.Owner),
+				color.New(color.FgHiBlack, color.Bold).Sprintf("%-32s", res.Hops[ttl][i].Hostname),
+			)
+		}
+
+		for j := 1; j < len(v); j++ {
+			if len(v) == 2 || j == 1 {
+				fmt.Fprintf(color.Output, "%s",
+					color.New(color.FgHiCyan, color.Bold).Sprintf("%s", v[j]),
+				)
+			} else {
+				fmt.Fprintf(color.Output, " / %s",
+					color.New(color.FgHiCyan, color.Bold).Sprintf("%s", v[j]),
+				)
+			}
+		}
+		for _, v := range res.Hops[ttl][i].MPLS {
+			fmt.Fprintf(color.Output, "%s",
+				color.New(color.FgHiBlack, color.Bold).Sprintf("\n    %s", v),
+			)
+		}
+		fmt.Println()
+		blockDisplay = true
 	}
 }

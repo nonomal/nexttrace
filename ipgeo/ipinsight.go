@@ -1,18 +1,23 @@
 package ipgeo
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
+	"time"
 
 	"github.com/tidwall/gjson"
 )
 
-func IPInSight(ip string) (*IPGeoData, error) {
-	resp, err := http.Get("https://ipinsight.io/query?ip=" + ip)
+func IPInSight(ip string, timeout time.Duration, _ string, _ bool) (*IPGeoData, error) {
+	client := &http.Client{
+		// 2 秒超时
+		Timeout: timeout,
+	}
+	resp, err := client.Get(token.BaseOrDefault("https://api.ipinsight.io/ip/") + ip + "?token=" + token.ipinsight)
 	if err != nil {
 		return nil, err
 	}
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

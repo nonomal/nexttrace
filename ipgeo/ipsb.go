@@ -1,7 +1,7 @@
 package ipgeo
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -10,11 +10,11 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-func IPSB(ip string) (*IPGeoData, error) {
-	url := "https://api.ip.sb/geoip/" + ip
+func IPSB(ip string, timeout time.Duration, _ string, _ bool) (*IPGeoData, error) {
+	url := token.BaseOrDefault("https://api.ip.sb/geoip/") + ip
 	client := &http.Client{
 		// 2 秒超时
-		Timeout: 2 * time.Second,
+		Timeout: timeout,
 	}
 	req, _ := http.NewRequest("GET", url, nil)
 	// 设置 UA，ip.sb 默认禁止 go-client User-Agent 的 api 请求
@@ -24,7 +24,7 @@ func IPSB(ip string) (*IPGeoData, error) {
 		log.Println("api.ip.sb 请求超时(2s)，请切换其他API使用")
 		return nil, err
 	}
-	body, _ := ioutil.ReadAll(content.Body)
+	body, _ := io.ReadAll(content.Body)
 	res := gjson.ParseBytes(body)
 
 	if res.Get("country").String() == "" {
@@ -37,6 +37,6 @@ func IPSB(ip string) (*IPGeoData, error) {
 		Country:  res.Get("country").String(),
 		City:     res.Get("city").String(),
 		Prov:     res.Get("region").String(),
-		Isp:      res.Get("isp").String(),
+		Owner:    res.Get("isp").String(),
 	}, nil
 }

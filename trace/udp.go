@@ -2,13 +2,14 @@ package trace
 
 import (
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
-	"github.com/xgadget-lab/nexttrace/util"
+	"github.com/nxtrace/NTrace-core/util"
 	"golang.org/x/net/context"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -28,7 +29,8 @@ type UDPTracer struct {
 	final     int
 	finalLock sync.Mutex
 
-	sem *semaphore.Weighted
+	sem       *semaphore.Weighted
+	fetchLock sync.Mutex
 }
 
 func (t *UDPTracer) Execute() (*Result, error) {
@@ -37,7 +39,7 @@ func (t *UDPTracer) Execute() (*Result, error) {
 	}
 
 	var err error
-	t.icmp, err = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	t.icmp, err = icmp.ListenPacket("ip4:icmp", t.SrcAddr)
 	if err != nil {
 		return &t.res, err
 	}
@@ -52,7 +54,7 @@ func (t *UDPTracer) Execute() (*Result, error) {
 	go t.listenICMP()
 
 	t.sem = semaphore.NewWeighted(int64(t.ParallelRequests))
-	for ttl := 1; ttl <= t.MaxHops; ttl++ {
+	for ttl := t.BeginHop; ttl <= t.MaxHops; ttl++ {
 		// 如果到达最终跳，则退出
 		if t.final != -1 && ttl > t.final {
 			break
@@ -60,17 +62,25 @@ func (t *UDPTracer) Execute() (*Result, error) {
 		for i := 0; i < t.NumMeasurements; i++ {
 			t.wg.Add(1)
 			go t.send(ttl)
-
+			<-time.After(time.Millisecond * time.Duration(t.Config.PacketInterval))
 		}
 		if t.RealtimePrinter != nil {
 			// 对于实时模式，应该按照TTL进行并发请求
 			t.wg.Wait()
 			t.RealtimePrinter(&t.res, ttl-1)
 		}
-		time.Sleep(1 * time.Millisecond)
+		<-time.After(time.Millisecond * time.Duration(t.Config.TTLInterval))
 	}
+	go func() {
+		if t.AsyncPrinter != nil {
+			for {
+				t.AsyncPrinter(&t.res)
+				time.Sleep(200 * time.Millisecond)
+			}
+		}
+	}()
 	// 如果是表格模式，则一次性并发请求
-	if t.RealtimePrinter == nil {
+	if t.AsyncPrinter != nil {
 		t.wg.Wait()
 	}
 	t.res.reduce(t.final)
@@ -100,7 +110,7 @@ func (t *UDPTracer) listenICMP() {
 			case ipv4.ICMPTypeDestinationUnreachable:
 				t.handleICMPMessage(msg, rm.Body.(*icmp.DstUnreach).Data)
 			default:
-				log.Println("received icmp message of unknown type", rm.Type)
+				// log.Println("received icmp message of unknown type", rm.Type)
 			}
 		}
 	}
@@ -113,8 +123,8 @@ func (t *UDPTracer) handleICMPMessage(msg ReceivedMessage, data []byte) {
 		return
 	}
 	srcPort := util.GetUDPSrcPort(header)
-	//t.inflightRequestLock.Lock()
-	//defer t.inflightRequestLock.Unlock()
+	t.inflightRequestLock.Lock()
+	defer t.inflightRequestLock.Unlock()
 	ch, ok := t.inflightRequest[int(srcPort)]
 	if !ok {
 		return
@@ -158,34 +168,50 @@ func (t *UDPTracer) send(ttl int) error {
 	}
 
 	srcIP, srcPort, udpConn := t.getUDPConn(0)
+	defer udpConn.Close()
 
-	var payload []byte
-	if t.Quic {
-		payload = GenerateQuicPayloadWithRandomIds()
-	} else {
-		ipHeader := &layers.IPv4{
-			SrcIP:    srcIP,
-			DstIP:    t.DestIP,
-			Protocol: layers.IPProtocolTCP,
-			TTL:      uint8(ttl),
-		}
-
-		udpHeader := &layers.UDP{
-			SrcPort: layers.UDPPort(srcPort),
-			DstPort: layers.UDPPort(t.DestPort),
-		}
-		_ = udpHeader.SetNetworkLayerForChecksum(ipHeader)
-		buf := gopacket.NewSerializeBuffer()
-		opts := gopacket.SerializeOptions{
-			ComputeChecksums: true,
-			FixLengths:       true,
-		}
-		if err := gopacket.SerializeLayers(buf, opts, udpHeader, gopacket.Payload("HAJSFJHKAJSHFKJHAJKFHKASHKFHHKAFKHFAHSJK")); err != nil {
-			return err
-		}
-
-		payload = buf.Bytes()
+	//var payload []byte
+	//if t.Quic {
+	//	payload = GenerateQuicPayloadWithRandomIds()
+	//} else {
+	ipHeader := &layers.IPv4{
+		SrcIP:    srcIP,
+		DstIP:    t.DestIP,
+		Protocol: layers.IPProtocolUDP,
+		TTL:      uint8(ttl),
 	}
+
+	udpHeader := &layers.UDP{
+		SrcPort: layers.UDPPort(srcPort),
+		DstPort: layers.UDPPort(t.DestPort),
+	}
+	_ = udpHeader.SetNetworkLayerForChecksum(ipHeader)
+	buf := gopacket.NewSerializeBuffer()
+	opts := gopacket.SerializeOptions{
+		ComputeChecksums: true,
+		FixLengths:       true,
+	}
+
+	desiredPayloadSize := t.Config.PktSize
+	if desiredPayloadSize-8 > 0 {
+		desiredPayloadSize -= 8
+	}
+	payload := make([]byte, desiredPayloadSize)
+	// 设置随机种子
+	rand.Seed(time.Now().UnixNano())
+
+	// 填充随机数
+	for i := range payload {
+		payload[i] = byte(rand.Intn(256))
+	}
+	//copy(buf.Bytes(), payload)
+
+	if err := gopacket.SerializeLayers(buf, opts, udpHeader, gopacket.Payload(payload)); err != nil {
+		return err
+	}
+
+	//payload = buf.Bytes()
+	//}
 
 	err = ipv4.NewPacketConn(udpConn).SetTTL(ttl)
 	if err != nil {
@@ -193,13 +219,13 @@ func (t *UDPTracer) send(ttl int) error {
 	}
 
 	start := time.Now()
-	if _, err := udpConn.WriteTo(payload, &net.UDPAddr{IP: t.DestIP, Port: t.DestPort}); err != nil {
+	if _, err := udpConn.WriteTo(buf.Bytes(), &net.UDPAddr{IP: t.DestIP, Port: t.DestPort}); err != nil {
 		return err
 	}
 
 	// 在对inflightRequest进行写操作的时候应该加锁保护，以免多个goroutine协程试图同时写入造成panic
 	t.inflightRequestLock.Lock()
-	hopCh := make(chan Hop)
+	hopCh := make(chan Hop, 1)
 	t.inflightRequest[srcPort] = hopCh
 	t.inflightRequestLock.Unlock()
 	defer func() {
@@ -248,7 +274,12 @@ func (t *UDPTracer) send(ttl int) error {
 		h.TTL = ttl
 		h.RTT = rtt
 
-		h.fetchIPData(t.Config)
+		t.fetchLock.Lock()
+		defer t.fetchLock.Unlock()
+		err := h.fetchIPData(t.Config)
+		if err != nil {
+			return err
+		}
 
 		t.res.add(h)
 
